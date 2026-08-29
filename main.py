@@ -1,378 +1,105 @@
-from PIL import Image
+import pathlib
+import pycolmap
+import open3d as o3d
 import numpy as np
-
-from feature_detection import (
-    calculate_harris_response,
-    find_feature_points
-)
-
-from feature_matching import (
-    create_patch_descriptors,
-    find_ratio_matches
-)
-
-from geometry import (
-    ransac_fundamental_matrix
-)
-
-
-def load_image(path):
-
-    image = Image.open(
-        path
-    ).convert("L")
-
-    image = np.array(
-        image,
-        dtype=np.float32
-    )
-
-    return image
-
-
-def extract_features(
-        image_path
-):
-
-    print(
-        "\nGörüntü işleniyor:"
-    )
-
-    print(
-        image_path
-    )
-
-    image = load_image(
-        image_path
-    )
-
-    print(
-        "Görüntü boyutu:",
-        image.shape[1],
-        "x",
-        image.shape[0]
-    )
-
-    # ==================================================
-    # HARRIS
-    # ==================================================
-
-    harris = (
-        calculate_harris_response(
-            image
-        )
-    )
-
-    points = (
-        find_feature_points(
-            harris,
-            max_points=500
-        )
-    )
-
-    print(
-        "Bulunan Harris noktası:",
-        len(points)
-    )
-
-    # ==================================================
-    # DESCRIPTOR
-    # ==================================================
-
-    valid_points, descriptors = (
-        create_patch_descriptors(
-            image,
-            points,
-            patch_size=24
-        )
-    )
-
-    print(
-        "Geçerli feature:",
-        len(valid_points)
-    )
-
-    print(
-        "Descriptor boyutu:",
-        descriptors.shape
-    )
-
-    return (
-        valid_points,
-        descriptors
-    )
 
 
 def main():
+    base_dir = pathlib.Path(__file__).parent
+    image_dir = base_dir / "images"
+    output_dir = base_dir / "sfm_cikti"
+    output_dir.mkdir(exist_ok=True)
 
-    # ==================================================
-    # ETH3D DATASET
-    # ==================================================
+    database_path = output_dir / "database.db"
 
-    image1_path = (
-        "sfm_data/"
-        "1494491536630704618.png"
-    )
+    # 1. Fotoğraf kontrolü
+    uzantilar = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
+    gorseller = []
+    for ext in uzantilar:
+        gorseller.extend(list(image_dir.glob(ext)))
 
-    image2_path = (
-        "sfm_data/"
-        "1494491536704432618.png"
-    )
-
-    print(
-        "=================================="
-    )
-
-    print(
-        "CUSTOM SFM"
-    )
-
-    print(
-        "=================================="
-    )
-
-    # ==================================================
-    # FEATURE EXTRACTION
-    # ==================================================
-
-    points1, descriptors1 = (
-        extract_features(
-            image1_path
-        )
-    )
-
-    points2, descriptors2 = (
-        extract_features(
-            image2_path
-        )
-    )
-
-    # ==================================================
-    # FEATURE MATCHING
-    # ==================================================
-
-    print(
-        "\nFeature matching yapılıyor..."
-    )
-
-    matches = (
-        find_ratio_matches(
-            descriptors1,
-            descriptors2,
-            ratio_threshold=0.85
-        )
-    )
-
-    print(
-        "\nDescriptor eşleşmesi:",
-        len(matches)
-    )
-
-    if len(matches) < 8:
-
-        print(
-            "Yeterli eşleşme yok."
-        )
-
+    if not gorseller:
+        print(f"⚠️ HATA: '{image_dir}' klasörü boş!")
         return
 
-    # ==================================================
-    # MATCHED POINT ARRAYS
-    # ==================================================
+    print(f"📸 {len(gorseller)} adet 2D fotoğraf işleniyor...")
 
-    matched_points1 = []
+    if database_path.exists():
+        try:
+            database_path.unlink()
+        except PermissionError:
+            pass
 
-    matched_points2 = []
+    # 2. Özellik Çıkarımı ve Eşleştirme
+    print("\n[1/4] Fotoğraflardaki ortak noktalar taranıyor...")
+    try:
+        pycolmap.extract_features(database_path=database_path, image_path=image_dir, max_num_threads=1)
+    except TypeError:
+        pycolmap.extract_features(database_path=database_path, image_path=image_dir)
 
-    for match in matches:
+    try:
+        pycolmap.match_exhaustive(database_path=database_path, max_num_threads=1)
+    except TypeError:
+        pycolmap.match_exhaustive(database_path=database_path)
 
-        index1 = match[0]
-        index2 = match[1]
+    # 3. SfM Rekonstrüksiyonu
+    print("\n[2/4] 3B nokta bulutu hesaplanıyor (Sparse Cloud)...")
+    reconstructions = pycolmap.incremental_mapping(database_path, image_dir, output_dir)
 
-        point1 = points1[
-            index1
-        ]
+    # 4. Model Kontrolü
+    if reconstructions:
+        if isinstance(reconstructions, dict):
+            rec = max(reconstructions.values(), key=lambda r: r.num_points3D())
+        else:
+            rec = reconstructions[0]
 
-        point2 = points2[
-            index2
-        ]
+        # Nokta sayısı kontrolü (COLMAP başlangıç çifti bulamadıysa nokta üretemez)
+        if rec.num_points3D() == 0:
+            print("\n⚠️ HATA: COLMAP fotoğraflar arasında yeterli ortak nokta bulamadı!")
+            print("💡 Çözüm: Fotoğraf sayısını artırın ve çekimler arası %60-70 örtüşme olmasına dikkat edin.")
+            return
 
-        matched_points1.append(
-            [
-                point1[0],
-                point1[1]
-            ]
-        )
+        print(f"\n✅ COLMAP Model Oluşturdu! Toplam {rec.num_points3D()} nokta yakalandı.")
 
-        matched_points2.append(
-            [
-                point2[0],
-                point2[1]
-            ]
-        )
+        ply_yolu = output_dir / "obje_noktalari.ply"
+        rec.export_PLY(str(ply_yolu))
 
-    matched_points1 = np.array(
-        matched_points1,
-        dtype=np.float64
-    )
+        # 5. Open3D ile Yüzey (Mesh) Örme Adımı
+        print("\n[3/4] Noktalar birleştirilip KATI YÜZEY (Mesh) örülüyor...")
+        pcd = o3d.io.read_point_cloud(str(ply_yolu))
 
-    matched_points2 = np.array(
-        matched_points2,
-        dtype=np.float64
-    )
+        if not pcd.is_empty() and len(pcd.points) > 10:
+            # Yüzey yönlerini (normalleri) hesapla
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+            pcd.orient_normals_consistent_tangent_plane(k=15)
 
-    # ==================================================
-    # RANSAC
-    # ==================================================
+            # Poisson algoritması ile mesh üret
+            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
 
-    print(
-        "\n=================================="
-    )
+            # Open3D NumPy filtreleme (Vector1dVector hatasını çözen kısım)
+            densities_np = np.asarray(densities)
+            density_threshold = np.quantile(densities_np, 0.05)  # En düşük %5 yoğunluktaki gürültüleri temizle
+            vertices_to_remove = densities_np < density_threshold
+            mesh.remove_vertices_by_mask(vertices_to_remove)
 
-    print(
-        "RANSAC BAŞLIYOR"
-    )
+            mesh_yolu = output_dir / "obje_kati_model.ply"
+            o3d.io.write_triangle_mesh(str(mesh_yolu), mesh)
+            print(f"📁 Katı 3B Yüzey Kaydedildi: {mesh_yolu}")
 
-    print(
-        "=================================="
-    )
-
-    F, inlier_mask, errors = (
-        ransac_fundamental_matrix(
-            matched_points1,
-            matched_points2,
-            iterations=2000,
-            threshold=1.5
-        )
-    )
-
-    # ==================================================
-    # RANSAC SONUÇLARI
-    # ==================================================
-
-    inlier_count = int(
-        np.sum(
-            inlier_mask
-        )
-    )
-
-    outlier_count = (
-        len(matches)
-        -
-        inlier_count
-    )
-
-    inlier_ratio = (
-        inlier_count
-        /
-        len(matches)
-    )
-
-    print(
-        "\n=================================="
-    )
-
-    print(
-        "RANSAC TAMAMLANDI"
-    )
-
-    print(
-        "=================================="
-    )
-
-    print(
-        "Toplam eşleşme:",
-        len(matches)
-    )
-
-    print(
-        "Inlier:",
-        inlier_count
-    )
-
-    print(
-        "Outlier:",
-        outlier_count
-    )
-
-    print(
-        "Inlier oranı:",
-        round(
-            inlier_ratio * 100,
-            2
-        ),
-        "%"
-    )
-
-    # ==================================================
-    # FINAL FUNDAMENTAL MATRIX
-    # ==================================================
-
-    print(
-        "\n=================================="
-    )
-
-    print(
-        "FINAL FUNDAMENTAL MATRIX"
-    )
-
-    print(
-        "=================================="
-    )
-
-    print(
-        F
-    )
-
-    # ==================================================
-    # ERROR STATISTICS
-    # ==================================================
-
-    inlier_errors = errors[
-        inlier_mask
-    ]
-
-    print(
-        "\nSampson Error:"
-    )
-
-    print(
-        "Ortalama:",
-        np.mean(
-            inlier_errors
-        )
-    )
-
-    print(
-        "Median:",
-        np.median(
-            inlier_errors
-        )
-    )
-
-    print(
-        "Minimum:",
-        np.min(
-            inlier_errors
-        )
-    )
-
-    print(
-        "Maximum:",
-        np.max(
-            inlier_errors
-        )
-    )
-
-    print(
-        "\nBir sonraki aşama:"
-    )
-
-    print(
-        "F -> E -> R,t -> Triangulation"
-    )
+            print("\n[4/4] 🖥️ Katı Yüzey Modeli Ekrana Basılıyor...")
+            mesh.compute_vertex_normals()
+            o3d.visualization.draw_geometries(
+                [mesh],
+                window_name="Noktaların Yüzeye Dönüştürülmüş Hali (Mesh)",
+                width=1024,
+                height=768,
+                mesh_show_wireframe=True
+            )
+        else:
+            print("⚠️ Oluşturulan PLY dosyasında mesh örmek için yeterli nokta bulunamadı.")
+    else:
+        print("\n⚠️ COLMAP model oluşturamadı. Fotoğraflarınız birbirini yeterince kapsamıyor olabilir.")
 
 
 if __name__ == "__main__":
-
     main()
